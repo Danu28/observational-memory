@@ -61,6 +61,23 @@ export function buildWorkerArgv(opts: {
 	return [pi.command, ...args];
 }
 
+/**
+ * Windows assembles argv into a single CreateProcessW command line capped at 32767 chars
+ * (libuv surfaces the overrun as ENAMETOOLONG). POSIX limits a single argument to
+ * MAX_ARG_STRLEN (128 KiB) and the total to ARG_MAX. Chunk-sized payloads must never travel
+ * in argv — they go on stdin instead.
+ */
+const MAX_ARGV_CHARS = process.platform === "win32" ? 30_000 : 120_000;
+
+export function assertArgvFits(argv: string[]): void {
+	const total = argv.reduce((n, arg) => n + arg.length + 1, 0);
+	if (total > MAX_ARGV_CHARS) {
+		throw new Error(
+			`worker argv is ${total} chars, over the ${MAX_ARGV_CHARS}-char ${process.platform} limit; deliver the payload on stdin`,
+		);
+	}
+}
+
 export type WorkerExit = { code: number | null; signal: NodeJS.Signals | null; stderr: string };
 
 /**
@@ -75,21 +92,31 @@ export function spawnWorker(opts: {
 	cwd: string;
 	env: NodeJS.ProcessEnv;
 	signal?: AbortSignal;
+	/** Payload streamed to the worker's stdin; pi prepends piped stdin to the first prompt. */
+	stdin?: string;
 }): Promise<WorkerExit> {
 	const [command, ...rest] = opts.argv;
+	assertArgvFits(opts.argv);
 	mkdirSync(opts.cwd, { recursive: true });
 	return new Promise<WorkerExit>((resolvePromise) => {
 		const proc = spawn(command, rest, {
 			cwd: opts.cwd,
 			env: opts.env,
-			stdio: ["ignore", "ignore", "pipe"],
+			stdio: [opts.stdin === undefined ? "ignore" : "pipe", "ignore", "pipe"],
 		});
 		let stderr = "";
 		proc.stderr?.on("data", (d: Buffer) => {
 			stderr += d.toString();
 		});
-		proc.on("error", () => resolvePromise({ code: 1, signal: null, stderr: stderr || "spawn error" }));
+		proc.on("error", (error: NodeJS.ErrnoException) =>
+			resolvePromise({ code: 1, signal: null, stderr: stderr || `spawn ${error.code ?? "unknown"}` }),
+		);
 		proc.on("close", (code, signal) => resolvePromise({ code, signal, stderr }));
+		if (opts.stdin !== undefined) {
+			// Tolerate EPIPE if the worker dies before draining its stdin.
+			proc.stdin?.on("error", () => {});
+			proc.stdin?.end(opts.stdin);
+		}
 
 		if (opts.signal) {
 			const kill = () => {

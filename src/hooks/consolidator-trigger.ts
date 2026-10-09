@@ -54,12 +54,20 @@ function nextRunId(): string {
  * overflow lines. The journey is included verbatim so the consolidator updates it in place
  * (append a segment for this batch; compress the old tail only if over `journeyTargetTokens`).
  */
-function buildConsolidatorPrompt(memoryRoot: string, promote: Observation[], journeyTargetTokens: number): string {
+type ConsolidatorPrompt = { payload: string; instruction: string };
+
+function buildConsolidatorPrompt(
+	memoryRoot: string,
+	promote: Observation[],
+	journeyTargetTokens: number,
+): ConsolidatorPrompt {
 	const indexText = renderIndexFile(listTopics(memoryRoot));
 	const journeyText = readJourney(memoryRoot);
 	const journeyWords = Math.round((journeyTargetTokens * 3) / 4);
 	const obsLines = sortObservations(promote).map(observationToLine).join("\n");
-	return (
+	// The index + journey + observation batch is far too large for argv (Windows caps the command
+	// line at 32767 chars), so it travels on stdin while `-p` keeps only the closing instruction.
+	const payload =
 		`Current local time: ${nowTimestamp()}\n\n` +
 		"You are folding the observations below into the durable topic files under .memory/. " +
 		"Use this exact time string in the `updated` front-matter of any file you write, and in any new JOURNEY.md entry.\n\n" +
@@ -71,11 +79,14 @@ function buildConsolidatorPrompt(memoryRoot: string, promote: Observation[], jou
 		"===== END JOURNEY =====\n\n" +
 		"===== OBSERVATIONS TO CONSOLIDATE (each line is `<timestamp-id>  <content>`) =====\n" +
 		`${obsLines}\n` +
-		"===== END OBSERVATIONS =====\n\n" +
-		"Fold every observation above into topic files (create/merge/rewrite as needed). Then update " +
+		"===== END OBSERVATIONS =====";
+	// pi strips trailing whitespace from the piped payload and joins without a separator, so the
+	// blank-line separator has to live at the start of the `-p` instruction.
+	const instruction =
+		"\n\nFold every observation above into topic files (create/merge/rewrite as needed). Then update " +
 		`.memory/JOURNEY.md per your instructions — keep it under ~${journeyTargetTokens} tokens (~${journeyWords} words), ` +
-		"purely descriptive, no advice or next steps. Finish with a one-sentence confirmation."
-	);
+		"purely descriptive, no advice or next steps. Finish with a one-sentence confirmation.";
+	return { payload, instruction };
 }
 
 export function evaluateConsolidatorTrigger(pi: ExtensionAPI, runtime: Runtime, ctx: TriggerCtx): void {
@@ -110,14 +121,24 @@ async function dispatchConsolidator(
 	runtime.status.workerStart("consolidator", runId);
 
 	try {
-		const prompt = buildConsolidatorPrompt(runtime.memoryRoot, promote, runtime.config.journeyTargetTokens);
+		const { payload, instruction } = buildConsolidatorPrompt(
+			runtime.memoryRoot,
+			promote,
+			runtime.config.journeyTargetTokens,
+		);
 		const argv = buildWorkerArgv({
 			model: runtime.config.models.consolidator,
 			sessionName: `om-consolidator-${runId}`,
-			kickoffPrompt: prompt,
+			kickoffPrompt: instruction,
 		});
 		const env = buildWorkerEnv("consolidator", { memoryRoot: runtime.memoryRoot, runId });
-		const exit = await spawnWorker({ argv, cwd: runtime.memoryRoot, env, signal: controller.signal });
+		const exit = await spawnWorker({
+			argv,
+			cwd: runtime.memoryRoot,
+			env,
+			signal: controller.signal,
+			stdin: payload,
+		});
 		// Capture cost before the exit-code check so a partial run's spend is still recorded.
 		recordWorkerCost(pi, runtime, ctx, "consolidator", runId);
 		if (exit.code !== 0) {
