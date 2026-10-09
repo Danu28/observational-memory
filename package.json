@@ -4,6 +4,10 @@
   "description": "Observational memory for pi — tiered, subprocess-backed memory: parallel observers feed a branch-local ledger buffer; a consolidator (Phase B) promotes the oldest observations into durable .memory/ topic files.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Danu28/observational-memory.git"
+  },
   "pi": {
     "extensions": [
       "./extensions/observational-memory/index.ts"

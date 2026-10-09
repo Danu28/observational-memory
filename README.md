@@ -4,17 +4,15 @@ Tiered, subprocess-backed memory for pi.
 
 Parallel **observers** distill raw conversation chunks into atomic observations committed to the master's branch-local **ledger** (so memory stays correct under `/tree`); a deterministic, model-free **compaction** renders that buffer verbatim into the compaction block. A **consolidator** promotes the oldest observations into durable `.memory/<sessionId>/` topic files, bounding the buffer and giving each session its own durable, `grep`-able long-term memory (a fork seeds its memory from its parent).
 
-## Install (global, from this project path)
+## Install
+
+Install the public GitHub repository globally (available to all projects):
 
 ```bash
-# Run from anywhere — installs globally into ~/.pi/agent/settings.json (omit -l for global)
-pi install C:/Users/dhanu/Desktop/Pi-Tools/pi-observational-memory
-
-# Or run from this directory:
-# pi install .
-
-pi list   # verify observational-memory is listed
+pi install git:github.com/Danu28/observational-memory
 ```
+
+Or, from a local checkout, install it into the current project with `pi install .` (add `-l` to install globally). Verify the extension is installed with `pi list`.
 
 ## On/off gate (default OFF)
 
