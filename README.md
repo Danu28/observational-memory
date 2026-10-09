@@ -12,7 +12,7 @@ Install the public GitHub repository globally (available to all projects):
 pi install git:github.com/Danu28/observational-memory
 ```
 
-Or, from a local checkout, install it into the current project with `pi install .` (add `-l` to install globally). Verify the extension is installed with `pi list`.
+Or, from a local checkout, run `pi install .`; add `-l` to install it in the current project instead of globally. Verify the extension is installed with `pi list`.
 
 ## On/off gate (default OFF)
 
