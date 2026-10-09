@@ -13,7 +13,7 @@ import {
 	type Entry,
 	type SourceSlice,
 } from "../ledger/index.js";
-import type { Runtime } from "../runtime.js";
+import type { Runtime, ContextUsageLike } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
 import { readObserverResult, readWorkerCost, runCostPath, runResultPath } from "../spawn/runs.js";
 
@@ -21,7 +21,7 @@ type TriggerCtx = {
 	hasUI: boolean;
 	ui?: { notify: (message: string, level?: "info" | "warning" | "error") => void };
 	sessionManager: { getBranch: () => Entry[]; getEntries: () => Entry[] };
-	getContextUsage?: () => { tokens: number | null } | undefined;
+	getContextUsage?: () => ContextUsageLike | undefined;
 };
 
 let runCounter = 0;
@@ -75,6 +75,9 @@ export function evaluateObserverTriggers(pi: ExtensionAPI, runtime: Runtime, ctx
 	const hasUI = ctx.hasUI;
 	const ui = ctx.ui;
 	const sessionManager = ctx.sessionManager;
+	// Scale the observer chunk to the model's context window so the pipeline depth stays
+	// constant across models (11M windows do not fire 4× as many observers as 200K windows).
+	const budgets = runtime.refreshBudgets(ctx.getContextUsage?.()?.contextWindow);
 
 	// Collect one start-toast line per dispatched chunk, then fire a single batched
 	// notify after the loop. Firing inside the loop would cause pi's showStatus() to
@@ -88,9 +91,9 @@ export function evaluateObserverTriggers(pi: ExtensionAPI, runtime: Runtime, ctx
 		const remaining = rawTokensAfterIndex(branch, watermarkIndex);
 		// Use break (not return) so execution always reaches the post-loop notify.
 		// A return here would exit the function before the batched start-toast fires.
-		if (remaining < runtime.config.chunkTokens) break;
+		if (remaining < budgets.chunkTokens) break;
 
-		const slice = selectSourceSlice(branch, watermarkId, runtime.config.chunkTokens);
+		const slice = selectSourceSlice(branch, watermarkId, budgets.chunkTokens);
 		if (slice.entries.length === 0 || !slice.coversUpToId) break;
 
 		runtime.dispatchedCoversUpToId = slice.coversUpToId;
@@ -101,7 +104,7 @@ export function evaluateObserverTriggers(pi: ExtensionAPI, runtime: Runtime, ctx
 	}
 
 	if (startToastLines.length > 0) ui?.notify(startToastLines.join("\n"), "info");
-	runtime.refreshFooterGauges(sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);
+	runtime.refreshFooterGauges(sessionManager.getBranch(), ctx.getContextUsage?.());
 }
 
 async function dispatchObserver(
@@ -182,7 +185,7 @@ async function dispatchObserver(
 			pi.appendEntry(OM_OBSERVATIONS_RECORDED, { observations, coversUpToId });
 		}
 		runtime.status.workerDone(runId, observations.length);
-		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);
+		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.());
 		if (ctx.hasUI && ctx.ui) {
 			// Route through the coalescer: if another observer finishes in the same
 			// tick its line joins this one in a single multi-line notify call.

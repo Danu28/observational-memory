@@ -30,7 +30,7 @@ import {
 import { nowTimestamp } from "../ledger/serialize.js";
 import { renderIndexFile } from "../memory/index-render.js";
 import { atomicWrite, indexPath, listTopics, readJourney } from "../memory/paths.js";
-import type { Runtime } from "../runtime.js";
+import type { Runtime, ContextUsageLike } from "../runtime.js";
 import { buildWorkerArgv, buildWorkerEnv, spawnWorker } from "../spawn/launch.js";
 import { recordWorkerCost } from "./observer-trigger.js";
 
@@ -38,7 +38,7 @@ type TriggerCtx = {
 	hasUI: boolean;
 	ui?: { notify: (message: string, level?: "info" | "warning" | "error") => void };
 	sessionManager: { getBranch: () => Entry[]; getEntries: () => Entry[] };
-	getContextUsage?: () => { tokens: number | null } | undefined;
+	getContextUsage?: () => ContextUsageLike | undefined;
 };
 
 let runCounter = 0;
@@ -89,15 +89,21 @@ function buildConsolidatorPrompt(
 	return { payload, instruction };
 }
 
-export function evaluateConsolidatorTrigger(pi: ExtensionAPI, runtime: Runtime, ctx: TriggerCtx): void {
+export function evaluateConsolidatorTrigger(
+	pi: ExtensionAPI,
+	runtime: Runtime,
+	ctx: TriggerCtx,
+	options: { force?: boolean } = {},
+): void {
 	if (!runtime.enabled || runtime.config.passive) return;
 	if (runtime.consolidatorInFlight) return;
 
+	const budgets = runtime.refreshBudgets(ctx.getContextUsage?.()?.contextWindow);
 	const branch = ctx.sessionManager.getBranch();
 	const active = foldLedger(branch).activeObservations;
-	if (poolTokens(active) < runtime.config.consolidateAtPoolTokens) return;
+	if (!options.force && poolTokens(active) < budgets.consolidateAtPoolTokens) return;
 
-	const { promote } = selectPromotionOverflow(active, runtime.config.poolTargetTokens);
+	const { promote } = selectPromotionOverflow(active, budgets.poolTargetTokens);
 	if (promote.length === 0) return;
 
 	runtime.consolidatorInFlight = true;
@@ -163,7 +169,7 @@ async function dispatchConsolidator(
 		atomicWrite(indexPath(runtime.memoryRoot), renderIndexFile(listTopics(runtime.memoryRoot)));
 
 		runtime.status.workerDone(runId, toDrop.length);
-		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.()?.tokens ?? null);
+		runtime.refreshFooterGauges(ctx.sessionManager.getBranch(), ctx.getContextUsage?.());
 		if (ctx.hasUI && ctx.ui) {
 			runtime.queueToast(`om: consolidator promoted ${toDrop.length} obs`, "info", ctx.ui.notify.bind(ctx.ui));
 		}

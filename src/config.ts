@@ -12,6 +12,12 @@ export interface ConfiguredModel {
 export interface Config {
 	/** Raw-history token size of one observation chunk (fixed boundary). */
 	chunkTokens: number;
+	/**
+	 * Fraction of the live context window used as one observer chunk (0–1]. Scales observer
+	 * cadence with the model so the pipeline depth stays constant; an explicit `chunkTokens`
+	 * in settings overrides it, and an unknown window falls back to the absolute default.
+	 */
+	observerChunkPercent: number;
 	/** Overlap between adjacent chunks; default 0 in v1. */
 	chunkOverlapTokens: number;
 	/** Target size of the active observation pool; the buffer drains back toward this after consolidation. */
@@ -20,8 +26,19 @@ export interface Config {
 	consolidateAtPoolTokens: number;
 	/** Live context-window usage that triggers compaction. */
 	compactAtContextTokens: number;
+	/**
+	 * Fraction of the live context window at which compaction fires (0–1]. An explicit
+	 * `compactAtContextTokens` in settings overrides it; an unknown window falls back to the
+	 * absolute default.
+	 */
+	compactAtContextPercent: number;
 	/** Verbatim raw tail kept after the cutoff; snaps to a chunk boundary. */
 	tailTokens: number;
+	/**
+	 * Fraction of the context window kept as the verbatim tail (0–1]. An explicit `tailTokens`
+	 * in settings overrides it.
+	 */
+	tailPercent: number;
 	/**
 	 * Target size of `.memory/JOURNEY.md`, the running descriptive project history the
 	 * consolidator appends to and pushes into every compaction block. When the file grows past
@@ -48,11 +65,14 @@ export interface Config {
 
 export const DEFAULTS: Config = {
 	chunkTokens: 10_000,
+	observerChunkPercent: 0.05,
 	chunkOverlapTokens: 0,
 	poolTargetTokens: 10_000,
 	consolidateAtPoolTokens: 15_000,
 	compactAtContextTokens: 150_000,
+	compactAtContextPercent: 0.6,
 	tailTokens: 20_000,
+	tailPercent: 0.1,
 	journeyTargetTokens: 1_000,
 	observerConcurrency: 4,
 	resumeAfterMidRunCompaction: true,
@@ -71,6 +91,11 @@ const PASSIVE_ENV = "PI_OM_PASSIVE";
 
 function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return Number.isInteger(value) && typeof value === "number" && value > 0 ? value : undefined;
+}
+
+/** A fraction in (0, 1]; anything else (including 0 and >1) is rejected. */
+function fractionOrUndefined(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1 ? value : undefined;
 }
 
 function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
@@ -113,6 +138,11 @@ function normalizeSettingsConfig(value: Record<string, unknown>, base: Config): 
 	}
 	// chunkOverlapTokens may legitimately be 0.
 	if (value.chunkOverlapTokens === 0) normalized.chunkOverlapTokens = 0;
+	const fractionKeys = ["compactAtContextPercent", "observerChunkPercent", "tailPercent"] as const;
+	for (const key of fractionKeys) {
+		const normalizedValue = fractionOrUndefined(value[key]);
+		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
+	}
 	if (typeof value.resumeAfterMidRunCompaction === "boolean")
 		normalized.resumeAfterMidRunCompaction = value.resumeAfterMidRunCompaction;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
@@ -135,32 +165,106 @@ export function readEnvConfig(env: NodeJS.ProcessEnv = process.env): Partial<Con
 	return {};
 }
 
-function readNamespacedConfig(path: string, base: Config): Partial<Config> {
-	if (!existsSync(path)) return {};
+interface NamespacedConfig {
+	values: Partial<Config>;
+	/** Keys present in the user's settings under this namespace (for explicit-override detection). */
+	keys: Set<string>;
+}
+
+function readNamespacedConfig(path: string, base: Config): NamespacedConfig {
+	if (!existsSync(path)) return { values: {}, keys: new Set() };
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 		const nested = raw[SETTINGS_KEY];
-		return isRecord(nested) ? normalizeSettingsConfig(nested, base) : {};
+		if (!isRecord(nested)) return { values: {}, keys: new Set() };
+		return { values: normalizeSettingsConfig(nested, base), keys: new Set(Object.keys(nested)) };
 	} catch {
-		return {};
+		return { values: {}, keys: new Set() };
 	}
 }
 
-export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): Config {
+export interface LoadedConfig {
+	config: Config;
+	/** Absolute token knobs the user set explicitly; these beat percentage scaling. */
+	explicitKeys: Set<string>;
+}
+
+export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): LoadedConfig {
 	const globalPath = join(getAgentDir(), "settings.json");
 	const projectPath = join(cwd, ".pi", "settings.json");
 	const globalConfig = readNamespacedConfig(globalPath, DEFAULTS);
 	const projectConfig = readNamespacedConfig(projectPath, DEFAULTS);
 	const envConfig = readEnvConfig(env);
-	return {
+	const config: Config = {
 		...DEFAULTS,
-		...globalConfig,
-		...projectConfig,
+		...globalConfig.values,
+		...projectConfig.values,
 		...envConfig,
 		models: {
 			...DEFAULTS.models,
-			...globalConfig.models,
-			...projectConfig.models,
+			...globalConfig.values.models,
+			...projectConfig.values.models,
 		},
 	};
+	const explicitKeys = new Set<string>([...globalConfig.keys, ...projectConfig.keys]);
+	return { config, explicitKeys };
+}
+
+/** The absolute token knobs that an explicit user setting pins (disables percentage scaling). */
+export const TOKEN_BUDGET_KEYS = [
+	"chunkTokens",
+	"poolTargetTokens",
+	"consolidateAtPoolTokens",
+	"compactAtContextTokens",
+	"tailTokens",
+] as const;
+
+/** Effective token budgets for one context window; every threshold the orchestrator compares against. */
+export interface ResolvedBudgets {
+	chunkTokens: number;
+	poolTargetTokens: number;
+	consolidateAtPoolTokens: number;
+	compactAtContextTokens: number;
+	tailTokens: number;
+}
+
+/** Keep observer chunks sane on very small windows. */
+const MIN_CHUNK_TOKENS = 2_000;
+
+/**
+ * Resolve the effective token budgets for a model's context window.
+ *
+ * Per key, precedence is: (1) an explicit absolute set by the user, (2) the configured
+ * percentage of the context window, (3) the 200K-tuned absolute default (used when the window
+ * is unknown). The pool budgets follow the (possibly scaled) chunk so the observer → pool →
+ * consolidator pipeline keeps its shape: one chunk fills the target pool, 1.5 chunks trigger
+ * consolidation (today's 10K / 15K ratio), unless the user pinned them.
+ */
+export function resolveBudgets(
+	config: Config,
+	explicitKeys: ReadonlySet<string>,
+	contextWindow: number | undefined,
+): ResolvedBudgets {
+	const win =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 0
+			? contextWindow
+			: undefined;
+	const scale = (key: string, percent: number, fallback: number, min = 1): number => {
+		if (explicitKeys.has(key) || win === undefined) return fallback;
+		return Math.max(min, Math.round(win * percent));
+	};
+
+	const chunkTokens = scale("chunkTokens", config.observerChunkPercent, config.chunkTokens, MIN_CHUNK_TOKENS);
+	const poolTargetTokens = explicitKeys.has("poolTargetTokens") ? config.poolTargetTokens : chunkTokens;
+	const consolidateAtPoolTokens = explicitKeys.has("consolidateAtPoolTokens")
+		? config.consolidateAtPoolTokens
+		: Math.max(poolTargetTokens, Math.round(chunkTokens * 1.5));
+	const compactAtContextTokens = scale(
+		"compactAtContextTokens",
+		config.compactAtContextPercent,
+		config.compactAtContextTokens,
+	);
+	const tailTokens = scale("tailTokens", config.tailPercent, config.tailTokens);
+
+	return { chunkTokens, poolTargetTokens, consolidateAtPoolTokens, compactAtContextTokens, tailTokens };
 }

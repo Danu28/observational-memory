@@ -46,21 +46,23 @@ flowchart LR
 Pipeline: raw chunks → observers → observations → ledger → compaction block, with a
 consolidator draining the oldest observations into durable per-session memory files.
 
-- **Observer clock** (`turn_end` / `agent_start`): every `chunkTokens` of new raw history,
-  cut a fixed-token slice and fire an observer subprocess. Observers are embarrassingly
-  parallel pure mappers (capped by `observerConcurrency`); each commits its own
-  `coversUpToId` watermark, so out-of-order completion is fine.
+- **Observer clock** (`turn_end` / `agent_start`): every `chunkTokens` of new raw history
+  (default: 5% of the live context window, so cadence scales with the model), cut a fixed-token
+  slice and fire an observer subprocess. Observers are embarrassingly parallel pure mappers
+  (capped by `observerConcurrency`); each commits its own `coversUpToId` watermark, so
+  out-of-order completion is fine.
 - **Observation** = `{ timestamp, content, tokenCount }`. The precise event-`timestamp`
   doubles as the id; the orchestrator re-derives a unique, second-resolution id at commit
   (the observer only emits minute resolution).
-- **Compaction** (`agent_end` over `compactAtContextTokens`, when idle): waits for in-flight
+- **Compaction** (`turn_end` over the context threshold — default **60% of the model window**,
+  or an explicit `compactAtContextTokens` — when idle): waits for in-flight
   observers, then renders the active buffer plus a **memory map** (rendered live from
   `.memory/<session>/` topic front-matter) and a **journey** section (`.memory/<session>/JOURNEY.md`, read
   verbatim). The cutoff snaps to an observation chunk boundary so the verbatim tail is never
   double-represented.
 - **Consolidator clock** (`turn_end` / `agent_start`): when the active observation pool
-  exceeds `consolidateAtPoolTokens`, a single background consolidator subprocess folds the
-  **oldest** observations (above `poolTargetTokens`) into durable `.memory/<session>/<topic>.md`
+  exceeds `consolidateAtPoolTokens` (default: 1.5 observer chunks), a single background
+  consolidator subprocess folds the **oldest** observations (above `poolTargetTokens`) into durable `.memory/<session>/<topic>.md`
   files, then the orchestrator tombstones exactly the observations it reports — draining the
   buffer back toward target. Topic files are **scoped per session** (`.memory/<sessionId>/`,
   keyed by the immutable session-header id, so two sessions in the same project never share
@@ -114,11 +116,21 @@ Namespace `observational-memory` in `~/.pi/agent/settings.json` (global) or
 ```jsonc
 {
   "observational-memory": {
-    "chunkTokens": 5000,
+    // Context-relative budgets (fractions of the live model context window). These auto-scale
+    // across models: a 1M window yields ~50K observer chunks and compaction at 600K; a 200K
+    // window yields ~10K chunks and compaction at 120K. The observer chunk also sets the
+    // pipeline shape: pool target = 1 chunk, consolidation at 1.5 chunks.
+    "observerChunkPercent": 0.05,       // observer chunk = 5% of the context window
+    "compactAtContextPercent": 0.60,    // compact at 60% of the context window
+    "tailPercent": 0.10,                // verbatim tail = 10% of the context window
+    // Absolute token values are (a) the fallback when the window is unknown and (b) an explicit
+    // override: setting any of these under `observational-memory` pins that budget and opts it
+    // out of percentage scaling.
+    "chunkTokens": 10000,
     "chunkOverlapTokens": 0,
     "poolTargetTokens": 10000,           // buffer drains back toward this after consolidation
-    "consolidateAtPoolTokens": 20000,    // pool size that triggers a consolidation (200% of target)
-    "compactAtContextTokens": 100000,    // tune per model
+    "consolidateAtPoolTokens": 15000,    // pool size that triggers a consolidation (1.5× target)
+    "compactAtContextTokens": 150000,
     "tailTokens": 20000,                 // verbatim tail; snaps to a chunk boundary
     "journeyTargetTokens": 1000,         // pushed JOURNEY.md size; compress oldest segments past this
     "observerConcurrency": 4,

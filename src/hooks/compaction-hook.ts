@@ -123,7 +123,7 @@ export function registerCompactionHook(pi: ExtensionAPI, runtime: Runtime): void
 		runtime.compactHookInFlight = true;
 		try {
 			runtime.ensureConfig(ctx.cwd);
-			const tailTokens = runtime.config.tailTokens;
+			const tailTokens = runtime.refreshBudgets(ctx.getContextUsage?.()?.contextWindow).tailTokens;
 			const { firstKeptEntryId, tokensBefore } = event.preparation;
 
 			// Compute the snap from the CURRENT (pre-wait) branch. The snap only reads committed

@@ -1,6 +1,9 @@
-import { type Config, DEFAULTS, loadConfig } from "./config.js";
+import { type Config, type ResolvedBudgets, DEFAULTS, loadConfig, resolveBudgets } from "./config.js";
 import { foldLedger, poolTokens, rawTokensSinceObservationCoverage, sumSessionCost, type Entry } from "./ledger/index.js";
 import { StatusController } from "./ui/status-controller.js";
+
+/** The slice of pi's `getContextUsage()` the orchestrator reads. */
+export type ContextUsageLike = { tokens: number | null; contextWindow?: number; percent?: number | null };
 
 /**
  * In-process orchestrator state. Event-driven only — no daemon/timer beyond the status
@@ -8,6 +11,12 @@ import { StatusController } from "./ui/status-controller.js";
  */
 export class Runtime {
 	config: Config = { ...DEFAULTS };
+	/** Absolute token knobs the user set explicitly in settings; these beat percentage scaling. */
+	explicitKeys: ReadonlySet<string> = new Set();
+	/** Effective token budgets for the current model window (see `resolveBudgets`). */
+	budgets: ResolvedBudgets = resolveBudgets(DEFAULTS, new Set(), undefined);
+	private budgetsWindow: number | undefined;
+	private budgetsResolved = false;
 	configLoaded = false;
 
 	/** The per-session on/off gate (default OFF). Outermost guard in every handler. */
@@ -107,21 +116,42 @@ export class Runtime {
 
 	ensureConfig(cwd: string): void {
 		if (this.configLoaded) return;
-		this.config = loadConfig(cwd);
+		const loaded = loadConfig(cwd);
+		this.config = loaded.config;
+		this.explicitKeys = loaded.explicitKeys;
+		this.budgetsResolved = false;
 		this.configLoaded = true;
+		this.refreshBudgets(undefined);
+	}
+
+	/**
+	 * Resolve the effective token budgets against a model's context window. Cached by window so
+	 * repeated event-handler calls are free; recomputed when the model (window) changes.
+	 */
+	refreshBudgets(contextWindow: number | undefined): ResolvedBudgets {
+		const win =
+			contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 0
+				? contextWindow
+				: undefined;
+		if (this.budgetsResolved && win === this.budgetsWindow) return this.budgets;
+		this.budgets = resolveBudgets(this.config, this.explicitKeys, win);
+		this.budgetsWindow = win;
+		this.budgetsResolved = true;
+		return this.budgets;
 	}
 
 	/** Recompute the live footer gauges (next-observer + pool + context) from the current branch. */
-	refreshFooterGauges(branch: Entry[], contextTokens?: number | null): void {
+	refreshFooterGauges(branch: Entry[], usage?: ContextUsageLike | null): void {
 		if (!this.enabled) return;
+		const budgets = this.refreshBudgets(usage?.contextWindow);
 		const folded = foldLedger(branch);
 		this.status.setGauges({
 			nextValue: rawTokensSinceObservationCoverage(branch),
-			nextMax: this.config.chunkTokens,
+			nextMax: budgets.chunkTokens,
 			poolValue: poolTokens(folded.activeObservations),
-			poolMax: this.config.consolidateAtPoolTokens,
-			ctxValue: contextTokens ?? 0,
-			ctxMax: this.config.compactAtContextTokens,
+			poolMax: budgets.consolidateAtPoolTokens,
+			ctxValue: usage?.tokens ?? 0,
+			ctxMax: budgets.compactAtContextTokens,
 		});
 	}
 

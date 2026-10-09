@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { OM_RESUME, rawTokensSinceLastCompaction, type Entry } from "../ledger/index.js";
-import type { Runtime } from "../runtime.js";
+import type { Runtime, ContextUsageLike } from "../runtime.js";
 
 /**
  * Synthetic prompt that resumes the agent after a mid-run compaction. Delivered as a hidden
@@ -16,7 +16,7 @@ const RETRYABLE_ERROR_RE =
 	/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 
 function contextPressureTokens(
-	ctx: { getContextUsage?: () => { tokens: number | null } | undefined; sessionManager: { getBranch: () => Entry[] } },
+	ctx: { getContextUsage?: () => ContextUsageLike | undefined; sessionManager: { getBranch: () => Entry[] } },
 	threshold: number,
 ): { tokens: number; due: boolean } {
 	const live = ctx.getContextUsage?.()?.tokens;
@@ -74,7 +74,8 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 			return;
 		}
 
-		if (!contextPressureTokens(ctx, runtime.config.compactAtContextTokens).due) return;
+		if (!contextPressureTokens(ctx, runtime.refreshBudgets(ctx.getContextUsage?.()?.contextWindow).compactAtContextTokens).due)
+			return;
 
 		// Capture the resume decision NOW, from this turn's event — ctx state at onComplete
 		// (post-abort, post-reload) no longer reflects whether the turn had pending tool work.

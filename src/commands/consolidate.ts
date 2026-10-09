@@ -20,27 +20,21 @@ export function registerConsolidateCommand(pi: ExtensionAPI, runtime: Runtime): 
 				return;
 			}
 			runtime.ensureConfig(ctx.cwd);
+			const budgets = runtime.refreshBudgets(ctx.getContextUsage?.()?.contextWindow);
 			const branch = ctx.sessionManager.getBranch() as Entry[];
 			const active = foldLedger(branch).activeObservations;
-			const { promote } = selectPromotionOverflow(active, runtime.config.poolTargetTokens);
+			const { promote } = selectPromotionOverflow(active, budgets.poolTargetTokens);
 			if (promote.length === 0) {
 				if (ctx.hasUI) {
 					ctx.ui.notify(
-						`om: nothing to consolidate (pool ${poolTokens(active).toLocaleString()} tok <= target ${runtime.config.poolTargetTokens.toLocaleString()} tok)`,
+						`om: nothing to consolidate (pool ${poolTokens(active).toLocaleString()} tok <= target ${budgets.poolTargetTokens.toLocaleString()} tok)`,
 						"info",
 					);
 				}
 				return;
 			}
-			// Temporarily lower the threshold to 0 for this evaluation so the trigger fires
-			// regardless of the configured pool threshold.
-			const saved = runtime.config.consolidateAtPoolTokens;
-			runtime.config.consolidateAtPoolTokens = 0;
-			try {
-				evaluateConsolidatorTrigger(pi, runtime, ctx);
-			} finally {
-				runtime.config.consolidateAtPoolTokens = saved;
-			}
+			// Force past the pool threshold for this evaluation (no config mutation).
+			evaluateConsolidatorTrigger(pi, runtime, ctx, { force: true });
 		},
 	});
 }
